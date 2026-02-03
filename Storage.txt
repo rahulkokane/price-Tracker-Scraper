@@ -1,0 +1,1076 @@
+scrapy_utils.py (run 1000)
+# scraper_utils.py
+import requests, random, time, re
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+from urllib.parse import urljoin, quote_plus
+
+ua = UserAgent()
+HEADERS_BASE = {"Accept-Language": "en-IN,en;q=0.9"}
+
+def is_blocked(html):
+    """Detect CAPTCHA/blocked pages."""
+    if not html:
+        return True
+    low = html.lower()
+    checks = [
+        "enter the characters you see below",
+        "to discuss this issue",
+        "captcha",
+        "detected unusual traffic",
+        "sorry — something went wrong",
+        "/captcha/"
+    ]
+    return any(x in low for x in checks)
+
+def fetch(url, retries=3, timeout=20):
+    """
+    Fetch URL with rotating UA and retries.
+    Returns HTML text or None on failure/block.
+    """
+    headers = HEADERS_BASE.copy()
+    try:
+        headers["User-Agent"] = ua.random
+    except Exception:
+        headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code == 200 and not is_blocked(r.text):
+                return r.text
+            else:
+                status = getattr(r, "status_code", "N/A")
+                print(f"❌ Fetch attempt {attempt} got status={status} for {url}")
+        except Exception as e:
+            print(f"⚠️ Fetch exception attempt {attempt} for {url}: {e}")
+
+        # Backoff jitter (important)
+        wait = random.uniform(15, 20)
+        print(f"⏳ Waiting {wait:.1f}s before retrying...")
+        time.sleep(wait)
+
+    return None
+
+def parse_price(price_text):
+    """
+    Parse price like '₹24,999' -> float 24999.0
+    Returns float or None
+    """
+    if not price_text:
+        return None
+    # Remove non-digit/period characters
+    cleaned = re.sub(r"[^\d\.]", "", price_text)
+    if cleaned == "":
+        return None
+    try:
+        return float(cleaned)
+    except:
+        return None
+
+def _extract_title_from_div(div):
+    """
+    Robust title extraction from a single result `div`.
+    Try multiple selectors and fallbacks.
+    """
+    # 1) Common: <h2><a><span>Title</span></a></h2>
+    el = div.select_one("h2 a span")
+    if el and el.get_text(strip=True):
+        return el.get_text(strip=True)
+
+    # 2) h2 span (some variants)
+    el = div.select_one("h2 span")
+    if el and el.get_text(strip=True):
+        return el.get_text(strip=True)
+
+    # 3) a-size-medium / a-text-normal variants
+    el = div.select_one("span.a-size-medium.a-color-base")
+    if el and el.get_text(strip=True):
+        return el.get_text(strip=True)
+
+    el = div.select_one("span.a-size-base-plus.a-color-base.a-text-normal")
+    if el and el.get_text(strip=True):
+        return el.get_text(strip=True)
+
+    # 4) aria-label on the h2 (sometimes Amazon puts title in aria-label)
+    h2 = div.select_one("h2")
+    if h2 and h2.get("aria-label"):
+        return h2.get("aria-label").strip()
+
+    # 5) fallback: link text
+    link = div.select_one("h2 a")
+    if link:
+        text = link.get_text(strip=True)
+        if text:
+            return text
+
+    return None
+
+def parse_search_page(html, base_url="https://www.amazon.in"):
+    """
+    Parse Amazon search/results page.
+    Returns list of dicts: {asin, title, price(float), link, image}
+    Skips sponsored items and items missing title/price.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+
+    # selector for search result items
+    nodes = soup.select("div.s-main-slot div[data-asin]")
+    for div in nodes:
+        asin = div.get("data-asin")
+        if not asin:
+            continue
+
+        # Skip sponsored (multiple ways Amazon marks ads)
+        # We check for visible text "Sponsored" or known attribute values.
+        text_nodes = [t.strip() for t in div.stripped_strings]
+        joined = " ".join(text_nodes).lower()
+        if "sponsored" in joined:
+            # skip advertisements
+            continue
+        # also skip if component type indicates sponsored
+        comp = div.get("data-component-type") or ""
+        if "sp-sponsored" in comp.lower() or "sponsored" in comp.lower():
+            continue
+
+        title = _extract_title_from_div(div)
+
+        # price: offscreen has the formatted price
+        price_elem = div.select_one(".a-price .a-offscreen") or div.select_one(".a-price-whole")
+        price_text = price_elem.get_text(strip=True) if price_elem else None
+        price = parse_price(price_text)
+
+        # image
+        img = div.select_one("img.s-image")
+        img_url = img.get("src") if img else None
+
+        # product link (relative)
+        link_tag = div.select_one("h2 a")
+        link = urljoin(base_url, link_tag.get("href")) if link_tag and link_tag.get("href") else None
+
+        # only accept fully populated items
+        if asin and title and price is not None:
+            results.append({
+                "asin": asin,
+                "title": title,
+                "price": price,
+                "image": img_url,
+                "link": link
+            })
+
+    return results
+
+def parse_product_page(html):
+    """
+    Parse a single product page. Returns dict {title, price (float), image} or None.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # title
+    t = soup.select_one("#productTitle")
+    title = t.get_text(strip=True) if t else None
+    if not title:
+        # fallback to og:title or <title>
+        og = soup.select_one("meta[property='og:title']")
+        if og and og.get("content"):
+            title = og.get("content").strip()
+        elif soup.title:
+            title = soup.title.get_text(strip=True)
+
+    # price (multiple fallbacks)
+    price_elem = (soup.select_one(".a-price .a-offscreen")
+                  or soup.select_one("#priceblock_ourprice")
+                  or soup.select_one("#priceblock_dealprice")
+                  or soup.select_one("#priceblock_saleprice"))
+    price_text = price_elem.get_text(strip=True) if price_elem else None
+    price = parse_price(price_text)
+
+    # image
+    img = soup.select_one("#landingImage") or soup.select_one("#imgTagWrapperId img") or soup.select_one("img.s-image")
+    image = img.get("src") if img else None
+
+    if title and price is not None:
+        return {"title": title, "price": price, "image": image}
+    return None
+
+
+
+
+
+category_scraper.py(1000)
+
+# category_scraper.py
+"""
+Daily rotating category scraper:
+ - picks one category (via cycle_state in DB)
+ - scrapes pages until it has processed MAX_PRODUCTS_PER_DAY items (default 1000)
+ - polite delays: per-product and per-page
+ - updates cycle_state to next category for the next run
+ - graceful shutdown on Ctrl+C
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import time
+import random
+import signal
+import sys
+from urllib.parse import quote_plus
+
+from scraper_utils import fetch, parse_search_page
+from db import (
+    get_next_category,
+    update_last_category,
+    save_product,
+    save_price,
+    commit
+)
+
+# ----------------------- CONFIG -----------------------
+# You can override these with environment variables
+MAX_PRODUCTS_PER_DAY = int(os.getenv("MAX_PRODUCTS_PER_DAY", "1000"))
+MAX_PAGES_PER_CATEGORY = int(os.getenv("MAX_PAGES_PER_CATEGORY", "500"))  # safety cap
+PER_PRODUCT_MIN = float(os.getenv("PER_PRODUCT_MIN", "1.5"))
+PER_PRODUCT_MAX = float(os.getenv("PER_PRODUCT_MAX", "3.0"))
+PER_PAGE_MIN = float(os.getenv("PER_PAGE_MIN", "12"))
+PER_PAGE_MAX = float(os.getenv("PER_PAGE_MAX", "15"))
+
+# categories list (display_name, search keyword)
+CATEGORIES = [
+    ("Smartphones & Mobiles", "Smartphones+Mobiles"),
+    ("Laptops & Tablets", "laptops+tablets"),
+    ("Smartwatches & Wearables", "Smartwatches+Wearables"),
+    ("Home & Kitchen Appliances", "Home+Kitchen+Appliances"),
+]
+
+# global stop flag for graceful shutdown
+STOP_NOW = False
+
+def _signal_handler(sig, frame):
+    global STOP_NOW
+    print("\n⏹ Received stop signal — finishing current item then exiting gracefully...")
+    STOP_NOW = True
+
+# register handlers for Ctrl+C and termination
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+# ----------------------- SCRAPER -----------------------
+def scrape_single_category(idx, cname, keyword, max_pages=50, max_products=1000):
+    """
+    Scrape one category (keyword) page-by-page until max_products are processed
+    or pages exhausted or STOP_NOW is set. Returns (found_total, saved, skipped, processed).
+    """
+    base = "https://www.amazon.in/s?k=" + quote_plus(keyword)
+    found_total = 0        # total valid products parsed (from search pages)
+    saved = 0              # save_price returned True
+    skipped = 0            # save_price returned False (e.g. already scraped today)
+    processed = 0          # number of product items considered (count toward daily cap)
+
+    for page in range(1, min(max_pages, MAX_PAGES_PER_CATEGORY) + 1):
+        if STOP_NOW:
+            print("Stopping early due to signal.")
+            break
+
+        url = f"{base}&page={page}"
+        print(f"\n🌍 Fetching category '{cname}' — page {page}: {url}")
+
+        html = fetch(url)
+        if not html:
+            print("⚠️ Page fetch failed or blocked. Stopping category early.")
+            break
+
+        products = parse_search_page(html)
+        print(f"🔎 Parsed {len(products)} valid product(s) on page {page}")
+        if not products:
+            print("⚠️ No valid products on this page — stopping category early.")
+            break
+
+        for prod in products:
+            if STOP_NOW:
+                break
+
+            asin = prod.get("asin")
+            title = prod.get("title")
+            price = prod.get("price")  # numeric float (from parse_search_page)
+
+            # increment processed (counts towards daily cap)
+            processed += 1
+
+            # Check daily cap
+            if processed > max_products:
+                print(f"🔚 Reached daily cap: {max_products} products. Stopping.")
+                STOP = True
+                break
+
+            # sanity check (should be satisfied by parse_search_page)
+            if not asin or not title or price is None:
+                print(f"⚠️ Skipping incomplete item (asin/title/price missing): {asin}")
+                continue
+
+            # persist product & price
+            try:
+                save_product(asin, title, cname)
+                ok = save_price(asin, price, currency="INR")
+                if ok:
+                    saved += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                # log error, continue
+                print(f"❌ DB error for {asin}: {e}")
+
+            # polite per-product delay
+            time.sleep(random.uniform(PER_PRODUCT_MIN, PER_PRODUCT_MAX))
+
+            # check stop/cap again
+            if processed >= max_products:
+                print(f"🔚 Reached daily cap: {max_products} products. Stopping.")
+                break
+
+        # commit after each page
+        try:
+            commit()
+        except Exception as e:
+            print("⚠️ Commit error:", e)
+
+        # stop early if signal or cap reached
+        if STOP_NOW or processed >= max_products:
+            break
+
+        # polite per-page delay (12–15s default)
+        page_delay = random.uniform(PER_PAGE_MIN, PER_PAGE_MAX)
+        print(f"⏳ Sleeping {page_delay:.1f}s before next page...")
+        time.sleep(page_delay)
+
+    return found_total + len(products), saved, skipped, processed
+
+
+def main():
+    total_categories = len(CATEGORIES)
+    # get the next category index to scrape from DB (this should compute (last+1) % n)
+    idx = get_next_category(total_categories)
+    cname, keyword = CATEGORIES[idx]
+    print(f"🔁 Selected category index {idx} for today: {cname} (keyword={keyword})")
+    print(f"🔢 Daily cap (MAX_PRODUCTS_PER_DAY) = {MAX_PRODUCTS_PER_DAY}")
+
+    # scrape this category until cap or pages done
+    found, saved, skipped, processed = scrape_single_category(
+        idx=idx,
+        cname=cname,
+        keyword=keyword,
+        max_pages=MAX_PAGES_PER_CATEGORY,
+        max_products=MAX_PRODUCTS_PER_DAY
+    )
+
+    # update cycle state so next run picks next category
+    try:
+        update_last_category(idx)
+        commit()
+        print(f"🔄 cycle_state updated to {idx} (next run will pick the next index).")
+    except Exception as e:
+        print("⚠️ Failed to update cycle_state:", e)
+
+    print("\n✅ Run summary:")
+    print(f"Category: {cname}")
+    print(f"Found (page-parsed): {found}")
+    print(f"Processed (count toward cap): {processed}")
+    print(f"Saved (new price entries): {saved}")
+    print(f"Skipped (already scraped today / not inserted): {skipped}")
+    print("Done. Exit.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+category_scraper.py (4 cat 10 pages)
+"""
+Daily category scraper:
+ - scrapes ALL categories every day
+ - for each category, only scrapes 10 pages
+ - polite delays: per-product and per-page
+ - graceful shutdown on Ctrl+C
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import time
+import random
+import signal
+from urllib.parse import quote_plus
+
+from scraper_utils import fetch, parse_search_page
+from db import (
+    save_product,
+    save_price,
+    commit
+)
+
+# ----------------------- CONFIG -----------------------
+PAGES_PER_CATEGORY = int(os.getenv("PAGES_PER_CATEGORY", "10"))  # fixed 10 pages per category
+MAX_PAGES_PER_CATEGORY = int(os.getenv("MAX_PAGES_PER_CATEGORY", "500"))  # safety cap
+PER_PRODUCT_MIN = float(os.getenv("PER_PRODUCT_MIN", "1.5"))
+PER_PRODUCT_MAX = float(os.getenv("PER_PRODUCT_MAX", "3.0"))
+PER_PAGE_MIN = float(os.getenv("PER_PAGE_MIN", "12"))
+PER_PAGE_MAX = float(os.getenv("PER_PAGE_MAX", "15"))
+
+# categories list (display_name, search keyword)
+CATEGORIES = [
+    ("Smartphones & Mobiles", "Smartphones+Mobiles"),
+    ("Laptops & Tablets", "laptops+tablets"),
+    ("Smartwatches & Wearables", "Smartwatches+Wearables"),
+    ("Home & Kitchen Appliances", "Home+Kitchen+Appliances"),
+]
+
+# global stop flag for graceful shutdown
+STOP_NOW = False
+
+def _signal_handler(sig, frame):
+    global STOP_NOW
+    print("\n⏹ Received stop signal — finishing current item then exiting gracefully...")
+    STOP_NOW = True
+
+# register handlers for Ctrl+C and termination
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+# ----------------------- SCRAPER -----------------------
+def scrape_single_category(cname, keyword, max_pages=10):
+    """
+    Scrape one category (keyword) for exactly max_pages pages,
+    or stop early if no products / signal received.
+    Returns (found_total, saved, skipped, processed).
+    """
+    base = "https://www.amazon.in/s?k=" + quote_plus(keyword)
+    found_total = 0
+    saved = 0
+    skipped = 0
+    processed = 0
+
+    for page in range(1, min(max_pages, MAX_PAGES_PER_CATEGORY) + 1):
+        if STOP_NOW:
+            print("Stopping early due to signal.")
+            break
+
+        url = f"{base}&page={page}"
+        print(f"\n🌍 Fetching category '{cname}' — page {page}: {url}")
+
+        html = fetch(url)
+        if not html:
+            print("⚠️ Page fetch failed or blocked. Stopping category early.")
+            break
+
+        products = parse_search_page(html)
+        print(f"🔎 Parsed {len(products)} valid product(s) on page {page}")
+        if not products:
+            print("⚠️ No valid products on this page — stopping category early.")
+            break
+
+        for prod in products:
+            if STOP_NOW:
+                break
+
+            asin = prod.get("asin")
+            title = prod.get("title")
+            price = prod.get("price")
+
+            processed += 1
+
+            if not asin or not title or price is None:
+                print(f"⚠️ Skipping incomplete item (asin/title/price missing): {asin}")
+                continue
+
+            try:
+                save_product(asin, title, cname)
+                ok = save_price(asin, price, currency="INR")
+                if ok:
+                    saved += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                print(f"❌ DB error for {asin}: {e}")
+
+            # polite per-product delay
+            time.sleep(random.uniform(PER_PRODUCT_MIN, PER_PRODUCT_MAX))
+
+        # commit after each page
+        try:
+            commit()
+        except Exception as e:
+            print("⚠️ Commit error:", e)
+
+        if STOP_NOW:
+            break
+
+        # polite per-page delay
+        page_delay = random.uniform(PER_PAGE_MIN, PER_PAGE_MAX)
+        print(f"⏳ Sleeping {page_delay:.1f}s before next page...")
+        time.sleep(page_delay)
+
+        found_total += len(products)
+
+    return found_total, saved, skipped, processed
+
+
+def main():
+    print(f"📄 Daily scrape: {PAGES_PER_CATEGORY} pages per category")
+    overall_found = 0
+    overall_saved = 0
+    overall_skipped = 0
+    overall_processed = 0
+
+    for cname, keyword in CATEGORIES:
+        if STOP_NOW:
+            break
+
+        print(f"\n============================")
+        print(f"▶️ Starting category: {cname}")
+        print("============================")
+
+        found, saved, skipped, processed = scrape_single_category(
+            cname=cname,
+            keyword=keyword,
+            max_pages=PAGES_PER_CATEGORY
+        )
+
+        overall_found += found
+        overall_saved += saved
+        overall_skipped += skipped
+        overall_processed += processed
+
+        print(f"\n✅ Category summary: {cname}")
+        print(f"Found (page-parsed): {found}")
+        print(f"Processed (products): {processed}")
+        print(f"Saved (new price entries): {saved}")
+        print(f"Skipped (already scraped today / not inserted): {skipped}")
+        print("----------------------------")
+
+    print("\n📊 DAILY SUMMARY (all categories):")
+    print(f"Total Found: {overall_found}")
+    print(f"Total Processed: {overall_processed}")
+    print(f"Total Saved: {overall_saved}")
+    print(f"Total Skipped: {overall_skipped}")
+    print("✅ Done. Exit.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+category_scraper.py (4 cat 10 pg with userAgent rotarion)
+"""
+Daily category scraper:
+ - scrapes ALL categories every day
+ - for each category, only scrapes PAGES_PER_DAY pages (default=10)
+ - rotates headers (User-Agent, Referer, Accept-Language)
+ - retry with exponential backoff
+ - polite delays: per-product and per-page
+ - graceful shutdown on Ctrl+C
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import time
+import random
+import signal
+import requests
+from urllib.parse import quote_plus
+
+from scraper_utils import parse_search_page
+from db import save_product, save_price, commit
+
+# ----------------------- CONFIG -----------------------
+PAGES_PER_DAY = int(os.getenv("PAGES_PER_DAY", "10"))  # daily quota: 10 pages/category
+MAX_PAGES_PER_CATEGORY = int(os.getenv("MAX_PAGES_PER_CATEGORY", "500"))  # safety cap
+PER_PRODUCT_MIN = float(os.getenv("PER_PRODUCT_MIN", "1.5"))
+PER_PRODUCT_MAX = float(os.getenv("PER_PRODUCT_MAX", "3.0"))
+PER_PAGE_MIN = float(os.getenv("PER_PAGE_MIN", "12"))
+PER_PAGE_MAX = float(os.getenv("PER_PAGE_MAX", "15"))
+
+USER_AGENTS = [
+    # rotate across common browsers
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile Safari/604.1",
+]
+
+# categories list (display_name, search keyword)
+CATEGORIES = [
+    ("Smartphones & Mobiles", "Smartphones+Mobiles"),
+    ("Laptops & Tablets", "laptops+tablets"),
+    ("Smartwatches & Wearables", "Smartwatches+Wearables"),
+    ("Home & Kitchen Appliances", "Home+Kitchen+Appliances"),
+]
+
+STOP_NOW = False
+
+
+# ----------------------- SIGNAL HANDLERS -----------------------
+def _signal_handler(sig, frame):
+    global STOP_NOW
+    print("\n⏹ Received stop signal — finishing current item then exiting gracefully...")
+    STOP_NOW = True
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+# ----------------------- FETCH WITH RETRY -----------------------
+def fetch_with_retry(url, retries=3):
+    for i in range(retries):
+        if STOP_NOW:
+            return None
+
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.amazon.in/",
+        }
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return resp.text
+            else:
+                print(f"⚠️ HTTP {resp.status_code} on attempt {i+1} for {url}")
+        except Exception as e:
+            print(f"⚠️ Request error on attempt {i+1}: {e}")
+
+        # exponential backoff before retry
+        delay = 2 ** i + random.random()
+        print(f"⏳ Backing off {delay:.1f}s before retry...")
+        time.sleep(delay)
+
+    print("❌ Failed all retries, giving up on this URL.")
+    return None
+
+
+# ----------------------- SCRAPER -----------------------
+def scrape_single_category(cname, keyword):
+    """
+    Scrape one category for exactly PAGES_PER_DAY pages (default 10).
+    """
+    base = "https://www.amazon.in/s?k=" + quote_plus(keyword)
+    found_total = 0
+    saved = 0
+    skipped = 0
+    processed = 0
+
+    for page in range(1, min(PAGES_PER_DAY, MAX_PAGES_PER_CATEGORY) + 1):
+        if STOP_NOW:
+            print("Stopping early due to signal.")
+            break
+
+        url = f"{base}&page={page}"
+        print(f"\n🌍 Fetching category '{cname}' — page {page}: {url}")
+
+        html = fetch_with_retry(url)
+        if not html:
+            print("⚠️ Page fetch failed. Skipping page.")
+            continue
+
+        products = parse_search_page(html)
+        print(f"🔎 Parsed {len(products)} valid product(s) on page {page}")
+        if not products:
+            print("⚠️ No valid products on this page — stopping category early.")
+            break
+
+        for prod in products:
+            if STOP_NOW:
+                break
+
+            asin = prod.get("asin")
+            title = prod.get("title")
+            price = prod.get("price")
+
+            processed += 1
+
+            if not asin or not title or price is None:
+                print(f"⚠️ Skipping incomplete item (asin/title/price missing): {asin}")
+                skipped += 1
+                continue
+
+            try:
+                save_product(asin, title, cname)
+                ok = save_price(asin, price, currency="INR")
+                if ok:
+                    saved += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                print(f"❌ DB error for {asin}: {e}")
+
+            # polite per-product delay
+            time.sleep(random.uniform(PER_PRODUCT_MIN, PER_PRODUCT_MAX))
+
+        # commit after each page
+        try:
+            commit()
+        except Exception as e:
+            print("⚠️ Commit error:", e)
+
+        if STOP_NOW:
+            break
+
+        # polite per-page delay
+        page_delay = random.uniform(PER_PAGE_MIN, PER_PAGE_MAX)
+        print(f"⏳ Sleeping {page_delay:.1f}s before next page...")
+        time.sleep(page_delay)
+
+        found_total += len(products)
+
+    return found_total, saved, skipped, processed
+
+
+def main():
+    print(f"📄 Daily scrape: {PAGES_PER_DAY} pages per category")
+    overall_found = 0
+    overall_saved = 0
+    overall_skipped = 0
+    overall_processed = 0
+
+    for cname, keyword in CATEGORIES:
+        if STOP_NOW:
+            break
+
+        print(f"\n============================")
+        print(f"▶️ Starting category: {cname}")
+        print("============================")
+
+        found, saved, skipped, processed = scrape_single_category(cname, keyword)
+
+        overall_found += found
+        overall_saved += saved
+        overall_skipped += skipped
+        overall_processed += processed
+
+        print(f"\n✅ Category summary: {cname}")
+        print(f"Found (page-parsed): {found}")
+        print(f"Processed (products): {processed}")
+        print(f"Saved (new price entries): {saved}")
+        print(f"Skipped (already scraped / incomplete): {skipped}")
+        print("----------------------------")
+
+    print("\n📊 DAILY SUMMARY (all categories):")
+    print(f"Total Found: {overall_found}")
+    print(f"Total Processed: {overall_processed}")
+    print(f"Total Saved: {overall_saved}")
+    print(f"Total Skipped: {overall_skipped}")
+    print("✅ Done. Exit.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# db.py
+import os
+import psycopg2
+from dotenv import load_dotenv
+from datetime import datetime, date
+from scraper_utils import parse_price 
+from psycopg2.extras import Json
+
+load_dotenv()
+DB_URL = os.getenv("DATABASE_URL")
+
+conn = psycopg2.connect(DB_URL)
+cur = conn.cursor()
+
+def save_product(
+    asin,
+    title,
+    brand=None,
+    category=None,
+    img_url=None,
+    attributes=None
+):
+    """
+    Ensure product exists.
+    - Updates title, brand, category, img_url, attributes if product exists
+    - Inserts new product otherwise
+    """
+    cur.execute("SELECT id FROM products WHERE asin = %s", (asin,))
+    row = cur.fetchone()
+
+    if row:
+        pid = row[0]
+        cur.execute(
+            """
+            UPDATE products
+            SET title = %s,
+                brand = %s,
+                category = %s,
+                img_url = %s,
+                attributes = %s
+            WHERE id = %s
+            """,
+            (title, brand, category, img_url, Json(attributes) if attributes is not None else None , pid)
+        )
+        return pid
+
+    cur.execute(
+        """
+        INSERT INTO products (asin, title, brand, category, img_url, attributes)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (asin, title or asin, brand, category, img_url, Json(attributes) if attributes is not None else None)
+    )
+    pid = cur.fetchone()[0]
+    conn.commit()
+    print(
+    f"[DB] asin={asin}, brand={brand}, category={category}, img={img_url}"
+)
+
+    return pid
+
+
+import re
+from datetime import date
+from scraper_utils import parse_price  # make sure this exists
+
+# replace the save_price function in db.py with this
+import re
+from datetime import date, datetime
+
+def save_price(asin, price, currency="INR"):
+    """
+    Accepts price as either:
+      - numeric (int/float) OR
+      - raw price string (e.g. "₹24,999", "24,999")
+    Behavior:
+      - ensures product exists (creates placeholder if not)
+      - skips insertion if cache_scraped shows product was scraped today
+      - inserts numeric price into price_history and updates cache_scraped
+      - returns True if a price row was inserted, False otherwise
+    """
+    # --- normalize price to numeric ---
+    numeric_price = None
+    # if already numeric, accept it
+    if isinstance(price, (int, float)):
+        numeric_price = float(price)
+    else:
+        # try to parse string-like price
+        try:
+            s = str(price)
+        except Exception:
+            print(f"⚠️ save_price: price for {asin} is not string/number: {price!r}")
+            return False
+
+        # remove non-digit/period characters (handles ₹, commas, spaces)
+        cleaned = re.sub(r"[^\d\.]", "", s)
+        if cleaned == "":
+            print(f"⚠️ save_price: could not parse price for {asin}: {price!r}")
+            return False
+        try:
+            numeric_price = float(cleaned)
+        except Exception as e:
+            print(f"⚠️ save_price: numeric conversion failed for {asin}: {cleaned!r} ({e})")
+            return False
+
+    # --- ensure product exists and get id ---
+    cur.execute("SELECT id FROM products WHERE asin = %s", (asin,))
+    row = cur.fetchone()
+    if row:
+        pid = row[0]
+    else:
+        cur.execute("INSERT INTO products (asin, title) VALUES (%s, %s) RETURNING id", (asin, asin))
+        pid = cur.fetchone()[0]
+        print(f"🆕 Created placeholder product for asin={asin} id={pid}")
+
+    # --- check cache_scraped (skip if scraped today) ---
+    cur.execute("SELECT last_scraped FROM cache_scraped WHERE product_id = %s", (pid,))
+    row = cur.fetchone()
+    today = date.today()
+    if row and row[0] and row[0].date() == today:
+        # already scraped today -> skip
+        print(f"⏩ Skipped {asin} (already scraped today)")
+        return False
+
+    # --- insert into price_history ---
+    try:
+        cur.execute(
+            "INSERT INTO price_history (product_id, current_price, scraped_at) VALUES (%s, %s, NOW())",
+            (pid, numeric_price)
+        )
+    except Exception as e:
+        print(f"❌ DB insert error for price_history ({asin}): {e}")
+        return False
+
+    # --- upsert cache_scraped ---
+    try:
+        cur.execute("""
+            INSERT INTO cache_scraped (product_id, last_scraped)
+            VALUES (%s, %s)
+            ON CONFLICT (product_id) DO UPDATE SET last_scraped = EXCLUDED.last_scraped
+        """, (pid, datetime.now()))
+    except Exception as e:
+        print(f"⚠️ Failed to update cache_scraped for {asin}: {e}")
+
+    print(f"💾 Saved price for asin={asin} (product_id={pid}): {numeric_price:.2f} {currency}")
+    return True
+
+def update_cache(asin):
+    """
+    Legacy compatibility helper (kept so callers that still call update_cache work).
+    It updates cache_scraped with current timestamp for product corresponding to asin.
+    """
+    cur.execute("SELECT id FROM products WHERE asin=%s", (asin,))
+    row = cur.fetchone()
+    if not row:
+        return
+    pid = row[0]
+    cur.execute("""
+        INSERT INTO cache_scraped (product_id, last_scraped)
+        VALUES (%s, NOW())
+        ON CONFLICT (product_id) DO UPDATE SET last_scraped = EXCLUDED.last_scraped
+    """, (pid,))
+    print(f"🔁 Cache updated for asin={asin} (id={pid})")
+
+def get_next_category(total_categories):
+    """
+    Return next index (0..n-1) using cycle_state table.
+    """
+    cur.execute("SELECT last_category FROM cycle_state WHERE id = 1")
+    row = cur.fetchone()
+    last = row[0] if row and row[0] is not None else 0
+    next_idx = (last + 1) % total_categories
+    return next_idx
+def save_marketplace_result(data: dict):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO marketplace_results (
+                    source_product_id, marketplace, title, brand,
+                    clean_title, price, mrp, rating, img_url,
+                    product_url, attributes
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    data["source_product_id"],
+                    data["marketplace"],
+                    data["title"],
+                    data["brand"],
+                    data["clean_title"],
+                    data["price"],
+                    data["mrp"],
+                    data["rating"],
+                    data["img_url"],
+                    data["product_url"],
+                    data["attributes"],
+                )
+            )
+
+
+def update_last_category(idx):
+    cur.execute("UPDATE cycle_state SET last_category = %s WHERE id = 1", (idx,))
+
+def commit():
+    conn.commit()

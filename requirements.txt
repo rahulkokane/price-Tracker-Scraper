@@ -1,0 +1,8 @@
+beautifulsoup4==4.14.3
+fake_useragent==2.2.0
+playwright==1.57.0
+psycopg2_binary==2.9.10
+python-dotenv==1.2.1
+rapidfuzz==3.14.3
+Requests==2.32.5
+
