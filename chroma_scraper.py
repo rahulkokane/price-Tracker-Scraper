@@ -33,7 +33,7 @@ def scrape_chroma_search(
     search_url = f"{CHROMA_BASE}/searchB?q={search_query.replace(' ', '+')}%3Arelevance&text={search_query.replace(' ', '+')}"
     print("🌍 Chroma URL:", search_url)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
 
