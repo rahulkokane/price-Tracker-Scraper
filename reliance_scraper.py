@@ -16,7 +16,7 @@ def run_single_reliance_search(q, category, source_product_id, max_results=8):
     results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         page.goto("https://www.reliancedigital.in/", timeout=60000)
